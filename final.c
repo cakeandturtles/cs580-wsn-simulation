@@ -1,6 +1,7 @@
 #include "simlib.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #define FIRE_START 1
 #define FIRE_END 2
@@ -18,24 +19,31 @@ typedef struct {
     float x;
     float y;
     float temperature;
+    bool is_faulty;
+    bool is_outlier;
     float *readings;
+    int support;
+    bool duplicate;
+    float *LSH;
 } Node;
 
-int   num_clusters, num_nodes, total_fires_started, num_faulty_nodes,
-      total_nodes_faulted, m;
+int   num_clusters, num_nodes, total_fires_started, m, b,
+      num_measurements, min_sup_local, min_sup_group, similarity_threshold;
 float mean_interfire, mean_interfirestop, mean_internodefault,
       mean_internoderepair, mean_intermeasure;
 float *cluster_bounds_x1, *cluster_bounds_y1, *cluster_bounds_x2, *cluster_bounds_y2;
-Node **nodes;
+Node ***nodes;
 
 void initialize(void);
 void initializeClusters(void);
+Node *initNode(float, float);
 void fireStart(void);
 float dist(float, float, float, float);
 void fireEnd(void);
 void nodeFault(void);
 void nodeRepair(void);
 void measureNodes(void);
+void detectOutliers(void);
 void report(void);
 
 int main()
@@ -44,14 +52,18 @@ int main()
     init_simlib();
 
     /* read in input parameters wink wink */
-    m = 3;
+    m = 5;
+    b = 3;
     num_clusters = 3;
     num_nodes = 8;
-    mean_interfire = 180.0; //every 3 minutes
-    mean_interfirestop = 60.0; //lasts for a minute
-    mean_internodefault = 300.0; //every five minute
-    mean_internoderepair = 120.0; //takes two minutes
-    mean_intermeasure = 60.0; //every minute
+    mean_interfire = 300.0; //every five minutes
+    mean_interfirestop = 300.0; //lasts for five minutes
+    mean_internodefault = 600.0; //every 10 minute
+    mean_internoderepair = 6000.0; //takes 100 minutes
+    mean_intermeasure = 180.0; //every three minutes
+    min_sup_local = 3;
+    min_sup_group = 4;
+    similarity_threshold = 1;
 
     /* Initialize the simulation */
     initialize();
@@ -66,18 +78,23 @@ int main()
         //printf("%d\n", next_event_type);
         switch (next_event_type){
             case FIRE_START:
+                //printf("fire start\n");
                 fireStart();
                 break;
             case FIRE_END:
+                //printf("fire end\n");
                 fireEnd();
                 break;
             case NODE_FAULT:
+                //printf("node fault\n");
                 nodeFault();
                 break;
             case NODE_REPAIR:
+                //printf("node repair\n");
                 nodeRepair();
                 break;
             case MEASURE_NODES:
+                //printf("measure_nodes\n");
                 measureNodes();
                 break;
         }
@@ -92,8 +109,7 @@ int main()
 void report()
 {
     printf("total fires: %d\n", total_fires_started);
-    printf("current faulty nodes: %d\n", num_faulty_nodes);
-    printf("total faulty nodes: %d\n", total_nodes_faulted);
+    printf("TODO: stuff from detectOutliers function\n");
 }
 
 void initialize()
@@ -101,15 +117,17 @@ void initialize()
     //seed the random number generator
     clock_t clk;
     clk = clock();
+    printf("clock: %f\n", (float)clk);
     lcgrandst(clk, 1);
-
-    //initialize measurement variables
-    total_fires_started = 0;
-    num_faulty_nodes = 0;
-    total_nodes_faulted = 0;
 
     //initialize the clusters
     initializeClusters();
+
+    //initialize other state variables
+    num_measurements = 0;
+
+    //initialize measurement variables
+    total_fires_started = 0;
 
     //schedule next temperature change
     event_schedule(sim_time+expon(mean_interfire, 1), FIRE_START);
@@ -130,7 +148,7 @@ void initializeClusters()
     cluster_bounds_y1 = (float *)malloc(sizeof(float)*num_clusters);
     cluster_bounds_x2 = (float *)malloc(sizeof(float)*num_clusters);
     cluster_bounds_y2 = (float *)malloc(sizeof(float)*num_clusters);
-    nodes = (Node **)malloc(sizeof(Node *)*num_clusters);
+    nodes = (Node ***)malloc(sizeof(Node **)*num_clusters);
 
     int i;
 
@@ -183,7 +201,7 @@ void initializeClusters()
     //now, popular clusters with nodes
     int j;
     for (i = 0; i < num_clusters; i++){
-        nodes[i] = (Node *)malloc(sizeof(Node)*num_nodes);
+        nodes[i] = (Node **)malloc(sizeof(Node *)*num_nodes);
         float x1 = cluster_bounds_x1[i];
         float x2 = cluster_bounds_x2[i];
         float y1 = cluster_bounds_y1[i];
@@ -198,28 +216,15 @@ void initializeClusters()
         //odd number of nodes
         if (num_nodes % 2 == 1){
             xt = w/2;
-            yt = 0;
             for (j = 0; j < half; j++){
-                Node *node = (Node *)malloc(sizeof(Node));
-                node->x = xt + w/2;
-                node->y = yt + h/2;
-                node->temperature = 21.0; //room temperature, initially
-                node->readings = (float *)malloc(sizeof(float)*m);
-                int k;
-                for (k = 0; k < m; k++){
-                    node->readings[k] = node->temperature;
-                }
-                nodes[i][j] = *node;
+                Node *node = initNode(xt + w/2, 0 + h/2);
+                nodes[i][j] = node;
                 xt += w;
             }
             xt = 0;
-            yt = h;
             for (j = half; j < num_nodes; j++){
-                Node *node = (Node *)malloc(sizeof(Node));
-                node->x = xt + w/2;
-                node->y = yt + h/2;
-                node->temperature = 21.0; //room temperature, initially
-                nodes[i][j] = *node;
+                Node *node = initNode(xt + w/2, h + h/2);
+                nodes[i][j] = node;
                 xt += w;
             }
         }
@@ -228,22 +233,35 @@ void initializeClusters()
             xt = 0;
             yt = 0;
             for (j = 0; j < num_nodes; j+=2){
-                Node *node = (Node *)malloc(sizeof(Node));
-                node->x = xt + w/2;
-                node->y = 0 + h/2;
-                node->temperature = 21.0; //room temperature, initially
-                nodes[i][j] = *node;
+                Node *node = initNode(xt + w/2, 0 + h/2);
+                nodes[i][j] = node;
 
-                node = (Node *)malloc(sizeof(Node));
-                node->x = xt + w/2;
-                node->y = h + h/2;
-                node->temperature = 21.0; //room temperature, initially
-                nodes[i][j+1] = *node;
+                node = initNode(xt + w/2, h + h/2);
+                nodes[i][j+1] = node;
 
                 xt += w;
             }
         }
     }
+}
+
+Node *initNode(float x, float y){
+    int i;
+    Node *node = (Node *)malloc(sizeof(Node));
+    node->x = x;
+    node->y = y;
+    node->temperature = 21.0; //room temperature, initially
+    node->is_faulty = false;
+    node->support = 0;
+    node->readings = (float *)malloc(sizeof(float)*m);
+    for (i = 0; i < m; i++){
+        node->readings[i] = node->temperature;
+    }
+    node->LSH = (float *)malloc(sizeof(float)*b);
+    for (i = 0; i < b; i++){
+        node->LSH[i] = 0.0;
+    }
+    return node;
 }
 
 float dist(float x1, float y1, float x2, float y2)
@@ -268,8 +286,8 @@ void fireStart()
     int i, j;
     for (i = 0; i < num_clusters; i++){
         for (j = 0; j < num_nodes; j++){
-            Node node = nodes[i][j];
-            float distance = dist(node.x, node.y, fire_x, fire_y);
+            Node *node = nodes[i][j];
+            float distance = dist(node->x, node->y, fire_x, fire_y);
 
             //if node is unaffected by the fire, continue
             if (distance > fire_radius) continue;
@@ -280,7 +298,9 @@ void fireStart()
                     can get really big, but as long as we only measure over
                     a certain threshold when we measure node temperature, it
                     should be OK*/
-            node.temperature += FAULT_TEMPERATURE;
+            node->temperature += FAULT_TEMPERATURE;
+
+            //printf("Fire affect node: i: %d, j: %d, TEMP: %f\n", i, j, node->temperature);
         }
     }
 
@@ -304,30 +324,27 @@ void fireEnd()
     int i, j;
     for (i = 0; i < num_clusters; i++){
         for (j = 0; j < num_nodes; j++){
-            Node node = nodes[i][j];
-            float distance = dist(node.x, node.y, fire_x, fire_y);
+            Node *node = nodes[i][j];
+            float distance = dist(node->x, node->y, fire_x, fire_y);
 
             //the node was never affected by this fire
             if (distance > fire_radius) continue;
 
-            node.temperature -= FAULT_TEMPERATURE;
+            node->temperature -= FAULT_TEMPERATURE;
         }
     }
 }
 
 void nodeFault()
 {
-    //update metrics
-    num_faulty_nodes++;
-    total_nodes_faulted++;
-
     //pick a random cluster and node to fault from!!
     int cluster_index = (int)floor(uniform(0, num_clusters, 1));
     int node_index = (int)floor(uniform(0, num_nodes, 1));
 
     //fault the node!!!
-    Node node = nodes[cluster_index][node_index];
-    node.temperature += FAULT_TEMPERATURE;
+    Node *node = nodes[cluster_index][node_index];
+    node->temperature += FAULT_TEMPERATURE;
+    node->is_faulty = true;
 
     //schedule a repair???
     transfer[3] = cluster_index;
@@ -340,18 +357,266 @@ void nodeFault()
 
 void nodeRepair()
 {
-    //update (metrics)?
-    num_faulty_nodes--;
-
     //pick the cluster/node indices from the event list
     int cluster_index = transfer[3];
     int node_index = transfer[4];
 
     //fix the node!!!
-    Node node = nodes[cluster_index][node_index];
-    node.temperature -= FAULT_TEMPERATURE;
+    Node *node = nodes[cluster_index][node_index];
+    node->temperature -= FAULT_TEMPERATURE;
+    node->is_faulty = false;
 }
 
 void measureNodes()
 {
+    //make all the nodes take a new measurement!!
+    int i, j, k;
+    for (i = 0; i < num_clusters; i++){
+        for (j = 0; j < num_nodes; j++){
+            Node *node = nodes[i][j];
+
+            //move all the readings over one, discarding the last
+            for (k = m-2; k >= 0; k--){
+                node->readings[k+1] = node->readings[k];
+            }
+            //do a new reading!!!
+            node->readings[0] = node->temperature;
+
+            //reset FTDA variables
+            node->support = 0;
+        }
+    }
+
+    num_measurements++;
+    //if we've conducted m measurements, can perform an FTDA!
+    if (num_measurements == m){
+        num_measurements = 0;
+
+        detectOutliers();
+    }
+
+    //also, schedule the next node measurement!
+    event_schedule(sim_time+expon(mean_intermeasure, 1), MEASURE_NODES);
+}
+
+bool isSimilar(float *LSH1, float *LSH2)
+{
+    //cheat!!! check if the number of similar codes is greater than a similarity threshhold int
+    int num_similar, i;
+    num_similar = 0;
+    for (i = 0; i < b; i++){
+        if (LSH1[i] == LSH2[i]){
+            num_similar++;
+        }
+    }
+
+    return num_similar > similarity_threshold;
+}
+
+bool isSame(float *LSH1, float *LSH2)
+{
+    int i = 0;
+    for (i = 0; i < b; i++){
+        if (LSH1[i] != LSH2[i])
+            return false;
+    }
+    return true;
+}
+
+void detectOutliers()
+{
+    int i, j, k, l;
+
+    //printf("generate hyperplane!\n");
+
+    //generate a random hyperplane r (bxm)
+    float **r = (float **)malloc(sizeof(float *)*b);
+    //printf("R:\n\t");
+    for (i = 0; i < b; i++){
+        r[i] = (float *)malloc(sizeof(float)*m);
+        for (j = 0; j < m; j++){
+            r[i][j] = uniform(-1.0, 1.0, 1);
+            //printf("%f ", r[i][j]);
+        }
+        //printf("\n\t");
+    }
+
+
+    //printf("start PHASE ONE\n");
+    //PHASE ONE ---------------------------------------------
+    //generate a b-bit LSH for each node based on its last m readings
+    for (i = 0; i < num_clusters; i++){
+        for (j = 0; j < num_nodes; j++){
+            Node *node = nodes[i][j];
+            //node->LSH = (float *)malloc(sizeof(float)*b);
+            node->duplicate = false;
+
+            //printf("node: i: %d, j: %d, LSH: ", i, j);
+
+            //use hash function u x r >= 0 -> 1, else 0
+            //to generate b-bit LSH
+            for (k = 0; k < b; k++){
+                float lsh_temp = 0;
+                for (l = 0; l < m; l++){
+                    lsh_temp += node->readings[l] * r[k][l];
+                }
+                //printf("lsh temp?: %f\n", lsh_temp);
+                if (lsh_temp >= 0)
+                    node->LSH[k] = 1;
+                else node->LSH[k] = 0;
+            //    printf("%g", node->LSH[k]);
+            }
+            //printf("\t");
+        /*    for (k = 0; k < m; k++){
+                printf("%g, ", node->readings[k]);
+            }*/
+        //    printf("\n");
+        }
+    }
+    //free the random hyperplane as our LSHs have been generated
+
+    //printf("start PHASE TWO\n");
+    //PHASE TWO ----------------------------------------------
+    //Detect outliers and eliminate redundant data
+    //keep track of which nodes are counted as "outliers"
+
+    int true_positives = 0;  //detecting a faulty node correctly
+    int false_positives = 0; //detecting a non-faulty node as faulty
+    int false_negatives = 0; //NOT detecting a faulty node
+    int num_outliers = 0;
+    int num_true_outliers = 0;
+
+    Node ***outlier_nodes = (Node ***)malloc(sizeof(Node **)*num_clusters);
+    for (i = 0; i < num_clusters; i++){
+        //printf("i: %d\n", i);
+        outlier_nodes[i] = (Node **)malloc(sizeof(Node *)*num_nodes);
+        //printf("!");
+        int node_index = 0;
+        for (j = 0; j < num_nodes; j++){
+            //printf("\tj: %d\n", j);
+            outlier_nodes[i][j] = NULL;
+
+            Node *node1 = nodes[i][j];
+            node1->support = 0;
+            node1->duplicate = false;
+            node1->is_outlier = false;
+            if (node1->is_faulty)
+                num_true_outliers++;
+
+            //check for similarity!! ('eleminate outliers')
+            for (k = 0; k < num_nodes; k++){
+                if (k == j) continue;
+                Node *node2 = nodes[i][k];
+
+                if (isSimilar(node1->LSH, node2->LSH)){
+                    node1->support++;
+                }
+                if (isSame(node1->LSH, node2->LSH) && !node2->duplicate){
+                    node1->duplicate = true;
+                }
+            }
+            //printf("\t\tsupport: %d\n", node1->support);
+            //printf("node1 support: %d\n", node1.support);
+            //if it's a local outlier, add it to the cluster's list of local outliers!!
+            if (node1->support < min_sup_local)
+            {
+                outlier_nodes[i][node_index] = node1;
+                node_index++;
+                num_outliers++;
+            }else{
+                //we didn't detect a faulty node as an outlier!
+                if (node1->is_faulty)
+                    false_negatives++;
+            }
+        }
+    }
+    /*if (num_outliers > 0){
+        printf("temp outliers: %d\n", num_outliers);
+        printf("true outliers: %d\n", num_true_outliers);
+    }*/
+    //num_outliers = 0;
+    //printf("done with the first phase 2 loop bay bay\n");
+    //now, look through the local outliers of each cluster to determine if we can
+    //incraese their support count
+    for (i = 0; i < num_clusters; i++){
+        int node_index = 0;
+        for (j = 0; j < num_nodes; j++){
+            if (outlier_nodes[i][j] == NULL) break;
+
+            Node *outlier1 = outlier_nodes[i][j];
+            outlier1->support = 0; //TODO:: ??
+            for (k = 0; k < num_clusters; k++){
+                if (k == i) continue;
+                for (l = 0; l < num_nodes; l++){
+                    if (outlier_nodes[k][l] == NULL) break;
+                    Node *outlier2 = outlier_nodes[k][l];
+                    if (isSimilar(outlier1->LSH, outlier2->LSH)){
+                        outlier1->support++;
+                    }
+                }
+            }
+
+            //add to the true outlier list!!
+            if (outlier1->support < min_sup_group){
+                //we correctly identified a faulty node!
+                if (outlier1->is_faulty)
+                    true_positives++;
+                //we incorrectly identified a node as faulty
+                else false_positives++;
+
+                outlier1->is_outlier = true;
+                num_outliers++;
+            }else{
+                //we didn't detect a faulty node as a (true) outlier!
+                if (outlier1->is_faulty)
+                    false_negatives++;
+            }
+        }
+    }
+    //printf("true outliers: %d\n", num_outliers);
+    //free the temp outlier nodes cuz we ain't need em!
+    for (i = 0; i < num_clusters; i++){
+        free(outlier_nodes[i]);
+    }
+    free(outlier_nodes);
+    //
+    // if (num_outliers > 0){
+    //     printf("R:\n\t");
+    //     for (i = 0; i < b; i++){
+    //         //r[i] = (float *)malloc(sizeof(float)*m);
+    //         for (j = 0; j < m; j++){
+    //             //r[i][j] = uniform(-1.0, 1.0, 1);
+    //             printf("%f ", r[i][j]);
+    //         }
+    //         printf("\n\t");
+    //     }
+    // }
+    free(r);
+
+    //printf("start PHASE THREE\n");
+    //PHASE THREE -------------------------------------------
+    //Actually aggregate the data from eliminations above??
+    int num_bits_sent = 0;
+
+    for (i = 0; i < num_clusters; i++){
+        for (j = 0; j < num_nodes; j++){
+            Node *node = nodes[i][j];
+            if (node->duplicate || node->is_outlier) continue;
+
+            //'send' the data!!! (we've sent b bits)
+            num_bits_sent += b;
+        }
+    }
+
+    //now free the LSH as we only needed it for this detection!
+    for (i = 0; i < num_clusters; i++){
+        for (j = 0; j < num_nodes; j++){
+            Node *node = nodes[i][j];
+        }
+    }
+
+    printf("true positives:  %d\n", true_positives);
+    printf("false positives: %d\n", false_positives);
+    printf("false negatives: %d\n", false_negatives);
+    printf("num bits sent:   %d\n\n", num_bits_sent);
 }
